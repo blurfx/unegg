@@ -1,6 +1,6 @@
 # unegg
 
-Extract files from egg files.
+Extract files from egg archive.
 
 ## Installation
 

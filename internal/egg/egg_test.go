@@ -51,11 +51,6 @@ const sampleSplitHex = "" +
 	"45 47 47 41 00 01 01 00 00 00 00 00 00 00 " + // egg header
 	"62 A2 F5 24 00 08 00 00 00 00 00 02 00 00 00" // split header with next id=2
 
-// solid archive example from the spec (not supported yet)
-const sampleSolidHex = "" +
-	"45 47 47 41 00 01 01 00 00 00 00 00 00 00 " + // egg header
-	"60 A0 E5 24 00 00 00" // solid header with zero-length payload
-
 func writeSampleEgg(t *testing.T, path string) {
 	t.Helper()
 	writeHex(t, path, sampleSimpleHex)
@@ -176,6 +171,59 @@ func testdataPath(name string) string {
 	return filepath.Join(filepath.Dir(file), "..", "..", "testdata", name)
 }
 
+func buildSolidSample() []byte {
+	var buf bytes.Buffer
+	// EGG header
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEggHeader))
+	binary.Write(&buf, binary.LittleEndian, uint16(0x0100))
+	binary.Write(&buf, binary.LittleEndian, uint32(1)) // program id
+	binary.Write(&buf, binary.LittleEndian, uint32(0)) // reserved
+
+	// solid header
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureSolid))
+	buf.WriteByte(expectedExtraFlag)
+	binary.Write(&buf, binary.LittleEndian, uint16(0))
+
+	// end of egg header
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	// file a.txt (size 1)
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureFile))
+	binary.Write(&buf, binary.LittleEndian, uint32(0))
+	binary.Write(&buf, binary.LittleEndian, uint64(1))
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureFilename))
+	buf.WriteByte(expectedExtraFlag)
+	binary.Write(&buf, binary.LittleEndian, uint16(len("a.txt")))
+	buf.WriteString("a.txt")
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	// file b.txt (size 2)
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureFile))
+	binary.Write(&buf, binary.LittleEndian, uint32(1))
+	binary.Write(&buf, binary.LittleEndian, uint64(2))
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureFilename))
+	buf.WriteByte(expectedExtraFlag)
+	binary.Write(&buf, binary.LittleEndian, uint16(len("b.txt")))
+	buf.WriteString("b.txt")
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	// solid block holding "abc"
+	data := []byte("abc")
+	blockCRC := crc32.ChecksumIEEE(data)
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureBlock))
+	buf.WriteByte(0) // method store
+	buf.WriteByte(0) // hint
+	binary.Write(&buf, binary.LittleEndian, uint32(len(data)))
+	binary.Write(&buf, binary.LittleEndian, uint32(len(data)))
+	binary.Write(&buf, binary.LittleEndian, blockCRC)
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+	buf.Write(data)
+
+	// end of archive
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+	return buf.Bytes()
+}
+
 func TestParseSimpleArchive(t *testing.T) {
 	tmp := t.TempDir()
 	eggPath := filepath.Join(tmp, "simple.egg")
@@ -289,16 +337,6 @@ func TestParseSplitArchiveFails(t *testing.T) {
 	}
 }
 
-func TestParseSolidArchiveFails(t *testing.T) {
-	tmp := t.TempDir()
-	eggPath := filepath.Join(tmp, "solid.egg")
-	writeHex(t, eggPath, sampleSolidHex)
-
-	if _, err := Parse(eggPath); err == nil || err != ErrUnsupportedSolid {
-		t.Fatalf("parse error = %v, want ErrUnsupportedSolid", err)
-	}
-}
-
 func TestExtractZipCryptoArchive(t *testing.T) {
 	password := "pw"
 	name := "secret.txt"
@@ -364,6 +402,40 @@ func TestExtractProvidedTestdata(t *testing.T) {
 				t.Fatalf("content = %q, want %q", data, "unegg")
 			}
 		})
+	}
+}
+
+func TestExtractSolidArchiveSynthetic(t *testing.T) {
+	buf := buildSolidSample()
+	tmp := t.TempDir()
+	eggPath := filepath.Join(tmp, "solid.egg")
+	if err := os.WriteFile(eggPath, buf, 0o644); err != nil {
+		t.Fatalf("write solid sample: %v", err)
+	}
+
+	arc, err := Parse(eggPath)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !arc.IsSolid {
+		t.Fatalf("expected solid archive flag")
+	}
+
+	dest := filepath.Join(tmp, "out")
+	if err := arc.ExtractAll(ExtractOptions{Dest: dest, Quiet: true}); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	gotA, err := os.ReadFile(filepath.Join(dest, "a.txt"))
+	if err != nil {
+		t.Fatalf("read a.txt: %v", err)
+	}
+	gotB, err := os.ReadFile(filepath.Join(dest, "b.txt"))
+	if err != nil {
+		t.Fatalf("read b.txt: %v", err)
+	}
+	if string(gotA) != "a" || string(gotB) != "bc" {
+		t.Fatalf("extracted content = %q, %q; want %q, %q", gotA, gotB, "a", "bc")
 	}
 }
 

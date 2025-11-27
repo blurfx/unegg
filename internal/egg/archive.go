@@ -21,7 +21,6 @@ const (
 	signatureWindowsFileInfo      = 0x2C86950B
 	signatureEncrypt              = 0x08D1470F
 	signatureBlock                = 0x02B50C13
-	signatureDummy                = 0x07463307
 	signatureSkip                 = 0xFFFF0000
 	signatureEnd                  = 0x08E28222
 	FileAttributeDirectory        = 0x10
@@ -31,7 +30,6 @@ const (
 var (
 	ErrBadSignature     = errors.New("egg: invalid signature")
 	ErrUnsupportedSplit = errors.New("egg: split archives are not supported (start from first volume)")
-	ErrUnsupportedSolid = errors.New("egg: solid archives are not supported")
 )
 
 type Archive struct {
@@ -42,6 +40,7 @@ type Archive struct {
 	SplitAfter  uint32
 	Comment     string
 	Files       []File
+	SolidBlocks []Block
 	path        string
 	size        int64
 }
@@ -169,7 +168,6 @@ func (a *Archive) parsePrefix(r *reader) error {
 				return fmt.Errorf("egg: unexpected solid payload of size %d", size)
 			}
 			a.IsSolid = true
-			return ErrUnsupportedSolid
 		case signatureSkip:
 			// Skip header: follows same shape as split, ignore payload.
 			flag, err := r.u8()
@@ -205,7 +203,7 @@ func (a *Archive) parseFiles(r *reader) error {
 		}
 		switch sig {
 		case signatureFile:
-			file, err := parseFile(r)
+			file, err := parseFile(r, a.IsSolid, &a.SolidBlocks)
 			if err != nil {
 				return err
 			}
@@ -216,6 +214,15 @@ func (a *Archive) parseFiles(r *reader) error {
 				return err
 			}
 			a.Comment = comment
+		case signatureBlock:
+			if !a.IsSolid {
+				return fmt.Errorf("egg: unexpected block at archive level")
+			}
+			block, err := parseBlock(r)
+			if err != nil {
+				return err
+			}
+			a.SolidBlocks = append(a.SolidBlocks, *block)
 		case signatureEnd:
 			return nil
 		default:
@@ -224,7 +231,7 @@ func (a *Archive) parseFiles(r *reader) error {
 	}
 }
 
-func parseFile(r *reader) (*File, error) {
+func parseFile(r *reader, solid bool, solidBlocks *[]Block) (*File, error) {
 	idx, err := r.u32()
 	if err != nil {
 		return nil, err
@@ -239,6 +246,9 @@ func parseFile(r *reader) (*File, error) {
 		sig, err := r.u32()
 		if err != nil {
 			return nil, err
+		}
+		if sig == signatureEnd {
+			break
 		}
 		switch sig {
 		case signatureFilename:
@@ -266,14 +276,11 @@ func parseFile(r *reader) (*File, error) {
 				return nil, err
 			}
 			f.Encryption = enc
-		case signatureEnd:
-			goto Blocks
 		default:
 			return nil, fmt.Errorf("egg: unknown signature 0x%x in file extras", sig)
 		}
 	}
 
-Blocks:
 	for {
 		sig, err := r.u32()
 		if err != nil {
@@ -285,7 +292,11 @@ Blocks:
 			if err != nil {
 				return nil, err
 			}
-			f.Blocks = append(f.Blocks, *block)
+			if solid {
+				*solidBlocks = append(*solidBlocks, *block)
+			} else {
+				f.Blocks = append(f.Blocks, *block)
+			}
 		case signatureComment, signatureFile, signatureEnd:
 			// signature belongs to parent loop; rewind 4 bytes so caller sees it.
 			if err := r.skip(-4); err != nil {

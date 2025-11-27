@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ulikunitz/xz/lzma"
 )
@@ -24,8 +25,18 @@ type ExtractOptions struct {
 	Quiet       bool
 }
 
+type solidOutput struct {
+	path      string
+	file      *os.File
+	remaining int64
+	modTime   time.Time
+}
+
 // ExtractAll extracts every file in the archive to the destination folder.
 func (a *Archive) ExtractAll(opts ExtractOptions) error {
+	if a.IsSolid {
+		return a.extractSolid(opts)
+	}
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = runtime.NumCPU()
 	}
@@ -84,6 +95,45 @@ func (a *Archive) ExtractAll(opts ExtractOptions) error {
 	return nil
 }
 
+func decodeSolidBlock(archive *os.File, block *Block, dst io.Writer) error {
+	src := io.NewSectionReader(archive, block.Offset, int64(block.PackSize))
+	limited := io.LimitReader(src, int64(block.PackSize))
+
+	crc := crc32.NewIEEE()
+	counter := &writeCounter{w: io.Discard}
+	target := io.MultiWriter(dst, crc, counter)
+
+	var err error
+	switch block.Method {
+	case 0: // store
+		_, err = io.CopyN(target, limited, int64(block.UnpackSize))
+	case 1: // deflate (raw)
+		var fr io.ReadCloser
+		fr = flate.NewReader(limited)
+		defer fr.Close()
+		_, err = io.CopyN(target, fr, int64(block.UnpackSize))
+	case 2: // bzip2
+		br := bzip2.NewReader(limited)
+		_, err = io.CopyN(target, br, int64(block.UnpackSize))
+	case 3: // AZO
+		err = ErrUnsupportedMethod
+	case 4: // LZMA
+		err = decodeLZMA(limited, block, target)
+	default:
+		err = ErrUnsupportedMethod
+	}
+	if err != nil {
+		return err
+	}
+	if counter.n != int64(block.UnpackSize) {
+		return fmt.Errorf("egg: short decode (want %d, got %d)", block.UnpackSize, counter.n)
+	}
+	if crc.Sum32() != block.CRC {
+		return fmt.Errorf("egg: crc mismatch")
+	}
+	return nil
+}
+
 func extractFile(archive *os.File, dest string, f *File, password string) error {
 	if f.Path == "" {
 		f.Path = fmt.Sprintf("%08d", f.Index)
@@ -123,6 +173,127 @@ func extractFile(archive *os.File, dest string, f *File, password string) error 
 	// adjust mod time if available
 	if !f.ModTime.IsZero() {
 		_ = os.Chtimes(fullPath, f.ModTime, f.ModTime)
+	}
+	return nil
+}
+
+func (a *Archive) extractSolid(opts ExtractOptions) error {
+	// Solid archives must be streamed in order; ignore concurrency >1.
+	if err := os.MkdirAll(opts.Dest, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Open(a.path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var outputs []solidOutput
+	for i := range a.Files {
+		file := &a.Files[i]
+		if file.Path == "" {
+			file.Path = fmt.Sprintf("%08d", file.Index)
+		}
+		fullPath, err := secureJoin(opts.Dest, file.Path)
+		if err != nil {
+			return err
+		}
+
+		if file.Attributes&FileAttributeDirectory != 0 {
+			if err := os.MkdirAll(fullPath, 0o755); err != nil {
+				return err
+			}
+			if !file.ModTime.IsZero() {
+				_ = os.Chtimes(fullPath, file.ModTime, file.ModTime)
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			return err
+		}
+		out, err := os.Create(fullPath)
+		if err != nil {
+			return err
+		}
+		outputs = append(outputs, solidOutput{
+			path:      fullPath,
+			file:      out,
+			remaining: int64(file.Size),
+			modTime:   file.ModTime,
+		})
+	}
+
+	sink := &solidWriter{outputs: outputs}
+	for _, block := range a.SolidBlocks {
+		if err := decodeSolidBlock(f, &block, sink); err != nil {
+			return err
+		}
+	}
+	if err := sink.close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type solidWriter struct {
+	outputs []solidOutput
+	index   int
+}
+
+func (s *solidWriter) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		if s.index >= len(s.outputs) {
+			return written, fmt.Errorf("egg: solid stream has extra data")
+		}
+		cur := &s.outputs[s.index]
+		if cur.remaining == 0 {
+			if cur.file != nil {
+				if err := cur.file.Close(); err != nil {
+					return written, err
+				}
+				if !cur.modTime.IsZero() {
+					_ = os.Chtimes(cur.path, cur.modTime, cur.modTime)
+				}
+				cur.file = nil
+			}
+			s.index++
+			continue
+		}
+		if int64(len(p)) <= cur.remaining {
+			n, err := cur.file.Write(p)
+			cur.remaining -= int64(n)
+			written += n
+			return written, err
+		}
+		// partial write to finish current file.
+		chunk := cur.remaining
+		n, err := cur.file.Write(p[:chunk])
+		cur.remaining -= int64(n)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		p = p[chunk:]
+	}
+	return written, nil
+}
+
+func (s *solidWriter) close() error {
+	for i := range s.outputs {
+		cur := &s.outputs[i]
+		if cur.remaining != 0 {
+			return fmt.Errorf("egg: solid stream ended early")
+		}
+		if cur.file != nil {
+			if err := cur.file.Close(); err != nil {
+				return err
+			}
+			if !cur.modTime.IsZero() {
+				_ = os.Chtimes(cur.path, cur.modTime, cur.modTime)
+			}
+		}
 	}
 	return nil
 }
