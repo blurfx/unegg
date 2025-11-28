@@ -453,6 +453,33 @@ func TestExtractSplitArchives(t *testing.T) {
 	}
 }
 
+func TestUnicodeEmojiArchive(t *testing.T) {
+	archiveName := "미즈노아미水野亜美マーキュリー🌈🌕🌊.egg"
+	arc, err := Parse(testdataPath(archiveName))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(arc.Files) != 1 {
+		t.Fatalf("files len = %d, want 1", len(arc.Files))
+	}
+	wantName := "미즈노아미水野亜美マーキュリー🌈🌕🌊.txt"
+	if arc.Files[0].Path != wantName {
+		t.Fatalf("filename = %q, want %q", arc.Files[0].Path, wantName)
+	}
+
+	dest := t.TempDir()
+	if err := arc.ExtractAll(ExtractOptions{Dest: dest, Quiet: true}); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dest, wantName))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(content) != "미즈노아미水野亜美マーキュリー🌈🌕🌊" {
+		t.Fatalf("content = %q", content)
+	}
+}
+
 func TestSecureJoin(t *testing.T) {
 	base := t.TempDir()
 
