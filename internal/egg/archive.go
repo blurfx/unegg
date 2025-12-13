@@ -10,26 +10,38 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/blurfx/unegg/internal/archive"
 )
 
+// Internal format signatures.
 const (
-	signatureEggHeader            = 0x41474745
-	signatureSplit                = 0x24F5A262
-	signatureSolid                = 0x24E5A060
-	signatureFile                 = 0x0A8590E3
-	signatureFilename             = 0x0A8591AC
-	signatureComment              = 0x04C63672
-	signatureWindowsFileInfo      = 0x2C86950B
-	signatureEncrypt              = 0x08D1470F
-	signatureBlock                = 0x02B50C13
-	signatureSkip                 = 0xFFFF0000
-	signatureEnd                  = 0x08E28222
-	FileAttributeDirectory        = 0x10
-	expectedExtraFlag        byte = 0x00
+	signatureEggHeader       = 0x41474745 // "EGGA"
+	signatureSplit           = 0x24F5A262
+	signatureSolid           = 0x24E5A060
+	signatureFile            = 0x0A8590E3
+	signatureFilename        = 0x0A8591AC
+	signatureComment         = 0x04C63672
+	signatureWindowsFileInfo = 0x2C86950B
+	signatureEncrypt         = 0x08D1470F
+	signatureBlock           = 0x02B50C13
+	signatureSkip            = 0xFFFF0000
+	signatureEnd             = 0x08E28222
+	expectedExtraFlag        = 0x00
 )
 
+// SignatureHeader is the EGG archive magic number (exported for format detection).
+const SignatureHeader = signatureEggHeader
+
+// FileAttributeDirectory indicates a directory entry in file attributes.
+const FileAttributeDirectory = 0x10
+
+// Package errors.
 var (
-	ErrBadSignature     = errors.New("egg: invalid signature")
+	// ErrBadSignature indicates the file is not a valid EGG archive.
+	ErrBadSignature = archive.ErrBadSignature
+
+	// ErrUnsupportedSplit indicates a split archive volume other than the first.
 	ErrUnsupportedSplit = errors.New("egg: split archives are not supported (start from first volume)")
 )
 

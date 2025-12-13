@@ -3,52 +3,111 @@ package egg
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"hash/crc32"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/blurfx/unegg/internal/archive"
+	"github.com/blurfx/unegg/internal/crypto"
 )
 
-// simple archive example from the spec
-const sampleSimpleHex = "" +
-	"45 47 47 41 00 01 01 00 00 00 00 00 00 00 22 82 E2 08 " +
-	"E3 90 85 0A 00 00 00 00 05 00 00 00 00 00 00 00 22 82 E2 08 " +
-	"13 0C B5 02 00 00 05 00 00 00 05 00 00 00 86 A6 10 36 22 82 E2 08 " +
-	"68 65 6C 6C 6F " +
-	"22 82 E2 08"
+type sampleFile struct {
+	name      string
+	data      []byte
+	method    byte
+	encrypted bool
+	password  string
+	modTime   time.Time
+}
 
-// general file archive example from the spec
-const sampleGeneralHex = "" +
-	"45 47 47 41 00 01 01 00 00 00 00 00 00 00 22 82 E2 08 " + // egg header
-	"E3 90 85 0A 00 00 00 00 05 00 00 00 00 00 00 00 " + // file header
-	"AC 91 85 0A 00 09 00 68 65 6C 6C 6F 2E 74 78 74 " + // filename "hello.txt"
-	"0B 95 86 2C 00 09 00 23 C9 A3 4F 63 FB C7 01 00 " + // windows file info
-	"22 82 E2 08 " + // end of file header
-	"13 0C B5 02 00 00 05 00 00 00 05 00 00 00 86 A6 10 36 " + // block header (store)
-	"22 82 E2 08 " + // end of block header
-	"68 65 6C 6C 6F " + // data
-	"22 82 E2 08" // end of archive
+func buildEggArchive(t *testing.T, file sampleFile) []byte {
+	t.Helper()
 
-// encrypted archive example
-const sampleEncryptedHex = "" +
-	"45 47 47 41 00 01 01 00 00 00 00 00 00 00 22 82 E2 08 " + // egg header
-	"E3 90 85 0A 00 00 00 00 01 00 00 00 00 00 00 00 " + // file header, size 1
-	"AC 91 85 0A 00 01 00 78 " + // filename "x"
-	"0F 47 D1 08 00 11 00 00 " + // encrypt header (magic, flag, size=17, method=0)
-	"01 02 03 04 05 06 07 08 09 0A 0B 0C " + // verify
-	"00 00 00 00 " + // crc
-	"22 82 E2 08 " + // end of file header
-	"13 0C B5 02 00 00 01 00 00 00 01 00 00 00 00 00 00 00 " + // block header (store, crc 0)
-	"22 82 E2 08 " + // end of block header
-	"78 " + // data
-	"22 82 E2 08" // end of archive
+	var buf bytes.Buffer
+	packed := file.data
+	crc := crc32.ChecksumIEEE(file.data)
+
+	// EGG header
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEggHeader))
+	binary.Write(&buf, binary.LittleEndian, uint16(0x0100)) // version
+	binary.Write(&buf, binary.LittleEndian, uint32(1))      // program id
+	binary.Write(&buf, binary.LittleEndian, uint32(0))      // reserved
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	// File header
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureFile))
+	binary.Write(&buf, binary.LittleEndian, uint32(0)) // index
+	binary.Write(&buf, binary.LittleEndian, uint64(len(file.data)))
+
+	// Filename extra (if name provided)
+	if file.name != "" {
+		binary.Write(&buf, binary.LittleEndian, uint32(signatureFilename))
+		buf.WriteByte(expectedExtraFlag)
+		binary.Write(&buf, binary.LittleEndian, uint16(len(file.name)))
+		buf.WriteString(file.name)
+	}
+
+	// Windows file info extra (if modTime provided)
+	if !file.modTime.IsZero() {
+		binary.Write(&buf, binary.LittleEndian, uint32(signatureWindowsFileInfo))
+		buf.WriteByte(expectedExtraFlag)
+		binary.Write(&buf, binary.LittleEndian, uint16(9)) // size: 8 bytes filetime + 1 byte attr
+		// Convert to Windows FILETIME (100-nanosecond intervals since Jan 1, 1601)
+		const windowsToUnixOffset = 116444736000000000
+		ft := uint64(file.modTime.UnixNano()/100) + windowsToUnixOffset
+		binary.Write(&buf, binary.LittleEndian, ft)
+		buf.WriteByte(0x00) // attributes
+	}
+
+	// Encryption extra
+	var verifyEnc []byte
+	if file.encrypted {
+		verifyPlain := make([]byte, 12)
+		verifyPlain[11] = byte(crc >> 24)
+
+		enc := crypto.NewZipEncryptor(file.password)
+		verifyEnc = enc.EncryptBytes(verifyPlain)
+		packed = enc.EncryptBytes(file.data)
+
+		binary.Write(&buf, binary.LittleEndian, uint32(signatureEncrypt))
+		buf.WriteByte(expectedExtraFlag)
+		binary.Write(&buf, binary.LittleEndian, uint16(17)) // size: 1 method + 12 verify + 4 crc
+		buf.WriteByte(0)                                    // method: ZipCrypto
+		buf.Write(verifyEnc)
+		binary.Write(&buf, binary.LittleEndian, crc)
+	}
+
+	// End of file header extras
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	// Block header
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureBlock))
+	buf.WriteByte(file.method)                                   // method (0=store)
+	buf.WriteByte(0)                                             // hint
+	binary.Write(&buf, binary.LittleEndian, uint32(len(packed))) // unpack size
+	binary.Write(&buf, binary.LittleEndian, uint32(len(packed))) // pack size
+	binary.Write(&buf, binary.LittleEndian, crc)
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	// Block data
+	buf.Write(packed)
+
+	// End of archive
+	binary.Write(&buf, binary.LittleEndian, uint32(signatureEnd))
+
+	return buf.Bytes()
+}
 
 func writeSampleEgg(t *testing.T, path string) {
 	t.Helper()
-	writeHex(t, path, sampleSimpleHex)
+	data := buildEggArchive(t, sampleFile{data: []byte("hello"), method: 0})
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
 }
 
 func buildZipCryptoEgg(password, name string, data []byte) ([]byte, error) {
@@ -58,9 +117,9 @@ func buildZipCryptoEgg(password, name string, data []byte) ([]byte, error) {
 	verifyPlain := make([]byte, 12)
 	verifyPlain[11] = byte(crc >> 24)
 
-	enc := newZipEncryptor(password)
-	verifyEnc := enc.encryptBytes(verifyPlain)
-	cipherData := enc.encryptBytes(data)
+	enc := crypto.NewZipEncryptor(password)
+	verifyEnc := enc.EncryptBytes(verifyPlain)
+	cipherData := enc.EncryptBytes(data)
 
 	// EGG header
 	binary.Write(&buf, binary.LittleEndian, uint32(signatureEggHeader))
@@ -109,61 +168,9 @@ func buildZipCryptoEgg(password, name string, data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-type zipEncryptor struct {
-	keys [3]uint32
-}
-
-func newZipEncryptor(password string) *zipEncryptor {
-	z := &zipEncryptor{}
-	z.keys[0] = 0x12345678
-	z.keys[1] = 0x23456789
-	z.keys[2] = 0x34567890
-	for i := 0; i < len(password); i++ {
-		z.updateKeys(password[i])
-	}
-	return z
-}
-
-func (z *zipEncryptor) updateKeys(b byte) {
-	z.keys[0] = crc32ZipUpdate(z.keys[0], b)
-	z.keys[1] = (z.keys[1]+(z.keys[0]&0xff))*0x8088405 + 1
-	z.keys[2] = crc32ZipUpdate(z.keys[2], byte(z.keys[1]>>24))
-}
-
-func (z *zipEncryptor) decryptByte() byte {
-	tmp := z.keys[2] | 2
-	return byte((tmp * (tmp ^ 1)) >> 8)
-}
-
-func (z *zipEncryptor) encryptBytes(plain []byte) []byte {
-	out := make([]byte, len(plain))
-	for i := range plain {
-		ks := z.decryptByte()
-		out[i] = plain[i] ^ ks
-		z.updateKeys(plain[i])
-	}
-	return out
-}
-
-func writeHex(t *testing.T, path, hexStr string) {
-	t.Helper()
-	fields := strings.Fields(hexStr)
-	buf := make([]byte, len(fields))
-	for i, f := range fields {
-		b, err := hex.DecodeString(f)
-		if err != nil {
-			t.Fatalf("decode hex: %v", err)
-		}
-		buf[i] = b[0]
-	}
-	if err := os.WriteFile(path, buf, 0o644); err != nil {
-		t.Fatalf("write sample: %v", err)
-	}
-}
-
 func testdataPath(name string) string {
 	_, file, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(file), "..", "..", "testdata", name)
+	return filepath.Join(filepath.Dir(file), "..", "..", "testdata", "egg", name)
 }
 
 func buildSolidSample() []byte {
@@ -280,7 +287,16 @@ func TestExtractSimpleArchive(t *testing.T) {
 func TestParseGeneralArchive(t *testing.T) {
 	tmp := t.TempDir()
 	eggPath := filepath.Join(tmp, "general.egg")
-	writeHex(t, eggPath, sampleGeneralHex)
+	modTime := time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC)
+	data := buildEggArchive(t, sampleFile{
+		name:    "hello.txt",
+		data:    []byte("hello"),
+		method:  0,
+		modTime: modTime,
+	})
+	if err := os.WriteFile(eggPath, data, 0o644); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
 
 	arc, err := Parse(eggPath)
 	if err != nil {
@@ -304,7 +320,16 @@ func TestParseGeneralArchive(t *testing.T) {
 func TestParseEncryptedArchive(t *testing.T) {
 	tmp := t.TempDir()
 	eggPath := filepath.Join(tmp, "encrypted.egg")
-	writeHex(t, eggPath, sampleEncryptedHex)
+	data := buildEggArchive(t, sampleFile{
+		name:      "x",
+		data:      []byte("x"),
+		method:    0,
+		encrypted: true,
+		password:  "test",
+	})
+	if err := os.WriteFile(eggPath, data, 0o644); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
 
 	arc, err := Parse(eggPath)
 	if err != nil {
@@ -326,10 +351,13 @@ func TestExtractZipCryptoArchive(t *testing.T) {
 	name := "secret.txt"
 	plaintext := []byte("s")
 
-	data, err := buildZipCryptoEgg(password, name, plaintext)
-	if err != nil {
-		t.Fatalf("build sample: %v", err)
-	}
+	data := buildEggArchive(t, sampleFile{
+		name:      name,
+		data:      plaintext,
+		method:    0,
+		encrypted: true,
+		password:  password,
+	})
 
 	tmp := t.TempDir()
 	eggPath := filepath.Join(tmp, "zipcrypto.egg")
@@ -361,9 +389,8 @@ func TestExtractProvidedTestdata(t *testing.T) {
 		name     string
 		password string
 	}{
-		{name: "unegg.egg", password: ""},
-		{name: "unegg.1234.egg", password: "1234"},
-		{name: "unegg.1q2w3e4r!.egg", password: "1q2w3e4r!"},
+		{name: "normal.egg", password: ""},
+		{name: "encrypted.1q2w3e4r!.egg", password: "1q2w3e4r!"},
 	}
 
 	for _, tc := range cases {
@@ -483,19 +510,19 @@ func TestUnicodeEmojiArchive(t *testing.T) {
 func TestSecureJoin(t *testing.T) {
 	base := t.TempDir()
 
-	got, err := secureJoin(base, "nested/file.txt")
+	got, err := archive.SecureJoin(base, "nested/file.txt")
 	if err != nil {
-		t.Fatalf("secureJoin valid err: %v", err)
+		t.Fatalf("archive.SecureJoin valid err: %v", err)
 	}
 	want := filepath.Join(base, "nested/file.txt")
 	if got != want {
-		t.Fatalf("secureJoin valid = %q, want %q", got, want)
+		t.Fatalf("archive.SecureJoin valid = %q, want %q", got, want)
 	}
 
-	if _, err := secureJoin(base, "/abs/path"); err == nil {
-		t.Fatalf("secureJoin abs path should error")
+	if _, err := archive.SecureJoin(base, "/abs/path"); err == nil {
+		t.Fatalf("archive.SecureJoin abs path should error")
 	}
-	if _, err := secureJoin(base, "../escape"); err == nil {
-		t.Fatalf("secureJoin traversal should error")
+	if _, err := archive.SecureJoin(base, "../escape"); err == nil {
+		t.Fatalf("archive.SecureJoin traversal should error")
 	}
 }

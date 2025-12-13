@@ -1,6 +1,6 @@
 # unegg
 
-Extract files from egg archive.
+Extract files from egg (`.egg`) and alz (`.alz`) archives.
 
 ## Installation
 
@@ -17,7 +17,7 @@ See [Releases](https://github.com/blurfx/unegg/releases/latest)
 ## Usage
 
 ```
-Usage: unegg [options] <archive.egg>
+Usage: unegg [options] <archive.egg|archive.alz>
   -C string
         destination directory (default: archive base name)
   -j int
@@ -32,4 +32,5 @@ Example usage
 
 ```
 unegg photos.egg
+unegg photos.alz
 ```
